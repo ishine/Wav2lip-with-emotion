@@ -353,13 +353,7 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
                                                                     running_emo_loss / (step + 1),
                                                                     running_loss_fake_c / (step + 1),
                                                                     running_loss_real_c / (step + 1)))
-            # prog_bar.set_psotfix( { L1: (running_l1_loss / (step + 1)), Sync Loss: (running_sync_loss / (step + 1)), de_c_loss: (running_loss_de_c / (step + 1)), emo_loss: (running_emo_loss / (step + 1)), loss_fake_c: (running_loss_fake_c / (step + 1)), loss_real_c : (running_loss_real_c / (step + 1))})
-                                                                    
-                                                                    
-                                                                    
-                                                                    
-                                                                    
-
+                                                                                                     
         writer.add_scalar("Sync_Loss/train_gen", running_sync_loss/len(train_data_loader), global_epoch)
         writer.add_scalar("L1_Loss/train_gen", running_l1_loss/len(train_data_loader), global_epoch)
         writer.add_scalar("Emo_Loss/train_gen", running_emo_loss/len(train_data_loader), global_step)
