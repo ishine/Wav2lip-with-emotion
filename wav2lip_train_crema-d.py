@@ -25,7 +25,7 @@ parser.add_argument("--data_root", help="Root folder of the preprocessed LRS2 da
 
 parser.add_argument('--checkpoint_dir', help='Save checkpoints to this directory', required=True, type=str)
 parser.add_argument('--syncnet_checkpoint_path', help='Load the pre-trained Expert discriminator', required=True, type=str)
-# parser.add_argument('--emotion_disc_path', help='Load the pre-trained emotion discriminator', required=True, type=str)
+parser.add_argument('--emotion_disc_path', help='Load the pre-trained emotion discriminator', required=True, type=str)
 
 parser.add_argument('--checkpoint_path', help='Resume from this checkpoint', default=None, type=str)
 
@@ -240,12 +240,15 @@ def unfreezeNet(network):
         p.requires_grad = True
 
 device = torch.device("cuda" if use_cuda else "cpu")
+device_ids = list(range(torch.cuda.device_count()))
+
 syncnet = SyncNet().to(device)
-for p in syncnet.parameters():
-    p.requires_grad = False
+# syncnet = nn.DataParallel(syncnet, device_ids)
+freezeNet(syncnet)
 
 disc_emo = emo_disc.DISCEMO().to(device)
-# disc_emo.load_state_dict(torch.load(args.emotion_disc_path))
+# disc_emo = nn.DataParallel(disc_emo, device_ids)
+disc_emo.load_state_dict(torch.load(args.emotion_disc_path))
 emo_loss_disc = nn.CrossEntropyLoss()
 
 recon_loss = nn.L1Loss()
@@ -330,13 +333,13 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
             running_loss_fake_c += loss_fake_c.item()
             running_loss_real_c += loss_real_c.item()
 
-            if global_step % checkpoint_interval == 0:
+            if global_step == 1 or global_step % checkpoint_interval == 0:
                 save_sample_images(x, g, gt, global_step, checkpoint_dir)
 
             global_step += 1
             cur_session_steps = global_step - resumed_step
 
-            if global_step % checkpoint_interval == 0:
+            if global_step == 1 or global_step % checkpoint_interval == 0:
                 save_checkpoint(model, optimizer, global_step, checkpoint_dir, global_epoch)
                 save_checkpoint(disc_emo, disc_emo.opt, global_step,checkpoint_dir, global_epoch, prefix='disc_emo_')
 
@@ -345,7 +348,7 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
                     average_sync_loss = eval_model(test_data_loader, global_step, device, model, checkpoint_dir)
 
                     if average_sync_loss < .75:
-                        hparams.set_hparam('syncnet_wt', 0.01) # without image GAN a lesser weight is sufficient
+                        hparams.set_hparam('syncnet_wt', 0.03) # without image GAN a lesser weight is sufficient
 
             prog_bar.set_description('L1: {:.4f}, Sync Loss: {:.4f}, de_c_loss: {:.4f}, emo_loss: {:.4f} | loss_fake_c: {:.4f}, loss_real_c: {:.4f}'.format(running_l1_loss / (step + 1),
                                                                     running_sync_loss / (step + 1),
@@ -353,7 +356,7 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
                                                                     running_emo_loss / (step + 1),
                                                                     running_loss_fake_c / (step + 1),
                                                                     running_loss_real_c / (step + 1)))
-                                                                                                     
+                                                                    
         writer.add_scalar("Sync_Loss/train_gen", running_sync_loss/len(train_data_loader), global_epoch)
         writer.add_scalar("L1_Loss/train_gen", running_l1_loss/len(train_data_loader), global_epoch)
         writer.add_scalar("Emo_Loss/train_gen", running_emo_loss/len(train_data_loader), global_step)
@@ -365,7 +368,7 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
 
 def eval_model(test_data_loader, global_step, device, model, checkpoint_dir):
     eval_steps = 50
-    print('Evaluating for {} steps'.format(eval_steps))
+    print('\nEvaluating for {} steps'.format(eval_steps))
     sync_losses, recon_losses, losses_de_c, emo_losses = [], [], [], []
     losses_fake_c, losses_real_c = [], []
     step = 0
@@ -414,7 +417,7 @@ def eval_model(test_data_loader, global_step, device, model, checkpoint_dir):
                 averaged_loss_fake_c = sum(losses_fake_c) / len(losses_fake_c)
                 averaged_loss_real_c = sum(losses_real_c) / len(losses_real_c)
 
-                print('L1: {}, Sync Loss: {}, de_c_loss: {}, emo_loss: {} | loss_fake_c: {}, loss_real_c: {}'.format(
+                print('Sync Loss: {:.4f}, L1: {:.4f},  de_c_loss: {:.4f}, emo_loss: {:.4f} | loss_fake_c: {:.4f}, loss_real_c: {:.4f}'.format(
                     averaged_sync_loss, averaged_recon_loss, averaged_emo_loss,
                     averaged_loss_de_c, averaged_loss_de_c, averaged_loss_fake_c,
                     averaged_loss_real_c))
@@ -495,6 +498,7 @@ if __name__ == "__main__":
 
     # Model
     model = Wav2Lip().to(device)
+    # model = nn.DataParallel(model, device_ids)
     print('total trainable params {}'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
 
     optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad],
