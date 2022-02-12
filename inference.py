@@ -253,8 +253,9 @@ def main():
 
 	batch_size = args.wav2lip_batch_size
 	gen = datagen(full_frames.copy(), mel_chunks)
-
-	emotion = emotion_dict[args.emotion]
+    
+	emo = args.emotion
+	emotion = emotion_dict[emo]
 	emotion = to_categorical(emotion, num_classes=6)
 	emotion_ = torch.tensor(emotion).to(device)
 
@@ -271,6 +272,8 @@ def main():
 		img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
 		mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
 		emotion = emotion_.unsqueeze(0).repeat(img_batch.shape[0], 1)
+		if(i==0):
+			print(emotion)
 
 		with torch.no_grad():
 			pred, emo_label = model(mel_batch, img_batch, emotion)
@@ -279,19 +282,22 @@ def main():
 			print('\nHere is the emotion for every frame')
 			print(list_emos,'\n')
 
-
 		pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
 		
+		idx=0
 		for p, f, c in zip(pred, frames, coords):
 			y1, y2, x1, x2 = c
 			p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
 
 			f[y1:y2, x1:x2] = p
+			if not cv2.imwrite(f'results/{emo}/'+ str(idx) + '.jpg', f):
+				raise Exception("Could not write image")
+			idx = idx + 1
 			out.write(f)
 
 	out.release()
 
-	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', args.outfile)
+	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', f'results/{emo}.mp4')
 	subprocess.call(command, shell=platform.system() != 'Windows')
 
 if __name__ == '__main__':
