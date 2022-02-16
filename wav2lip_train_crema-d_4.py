@@ -17,7 +17,7 @@ import numpy as np
 from glob import glob
 
 import os, random, cv2, argparse
-import albumentations as A
+import utils
 from hparams import hparams, get_image_list
 
 parser = argparse.ArgumentParser(description='Code to train the Wav2Lip model without the visual quality discriminator')
@@ -35,7 +35,7 @@ args = parser.parse_args()
 
 global_step = 0
 global_epoch = 0
-os.environ['CUDA_VISIBLE_DEVICES']='3'
+os.environ['CUDA_VISIBLE_DEVICES']='1'
 use_cuda = torch.cuda.is_available()
 print('use_cuda: {}'.format(use_cuda))
 
@@ -83,34 +83,6 @@ class Dataset(object):
 
         self.filelist = np.array(self.filelist)
         print('Num files: ', len(self.filelist))
-
-        # to apply same augmentation for all the 10 frames (5 reference and 5 ground truth)
-        target = {}
-        for i in range(1, 2*emonet_T):
-            target['image' + str(i)] = 'image'
-        
-        self.augments = A.Compose([
-                        A.RandomBrightnessContrast(p=0.2),    
-                        A.RandomGamma(p=0.2),    
-                        A.CLAHE(p=0.2),
-                        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=50, val_shift_limit=50, p=0.2),  
-                        A.ChannelShuffle(p=0.2), 
-                        A.RGBShift(p=0.2),
-                        A.RandomBrightness(p=0.2),
-                        A.RandomContrast(p=0.2),
-                        A.GaussNoise(var_limit=(10.0, 50.0), p=0.25),
-                    ], additional_targets=target, p=0.8)
-    
-    def augmentVideo(self, video):
-        args = {}
-        args['image'] = video[0, :, :, :]
-        for i in range(1, 2*emonet_T):
-            args['image' + str(i)] = video[i, :, :, :]
-        result = self.augments(**args)
-        video[0, :, :, :] = result['image']
-        for i in range(1, 2*emonet_T):
-            video[i, :, :, :] = result['image' + str(i)]
-        return video
 
     def get_frame_id(self, frame):
         return int(basename(frame).split('.')[0])
@@ -226,22 +198,13 @@ class Dataset(object):
             indiv_mels = self.get_segmented_mels(orig_mel.copy(), img_name)
             if indiv_mels is None: continue
 
-            window = np.asarray(window)
+            window = self.prepare_window(window)
             y = window.copy()
             # window[:, :, window.shape[2]//2:] = 0.
             # we need to generate whole face as we are incorporating emotion
             window[:, :, :] = 0.
 
-            wrong_window = np.asarray(wrong_window)
-            conact_for_aug = np.concatenate([y, wrong_window], axis=0)
-
-            aug_results = self.augmentVideo(conact_for_aug)
-            y, wrong_window = np.split(aug_results, 2, axis=0)
-
-            y = np.transpose(y, (3, 0, 1, 2)) / 255
-            window = np.transpose(window, (3, 0, 1, 2))
-            wrong_window = np.transpose(wrong_window, (3, 0, 1, 2)) / 255
-
+            wrong_window = self.prepare_window(wrong_window)
             x = np.concatenate([window, wrong_window], axis=0)
 
             x = torch.FloatTensor(x)
@@ -290,7 +253,9 @@ disc_emo = emo_disc.DISCEMO().to(device)
 disc_emo.load_state_dict(torch.load(args.emotion_disc_path))
 emo_loss_disc = nn.CrossEntropyLoss()
 
+perceptual_loss = utils.perceptionLoss(device)
 recon_loss = nn.L1Loss()
+
 def get_sync_loss(mel, g):
     g = g[:, :, :, g.size(3)//2:]
     g = torch.cat([g[:, :, i] for i in range(syncnet_T)], dim=1)
@@ -307,8 +272,7 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
     while global_epoch < nepochs:
         print('Starting Epoch: {}'.format(global_epoch))
         running_sync_loss, running_l1_loss = 0., 0.
-        running_loss_de_c = 0.0
-        # running_loss_de_c, running_emo_loss = 0., 0.
+        running_ploss, running_loss_de_c = 0., 0.
         running_loss_fake_c, running_loss_real_c = 0., 0.
         prog_bar = tqdm(enumerate(train_data_loader))
         for step, (x, indiv_mels, mel, gt, emotion) in prog_bar:
@@ -332,20 +296,20 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
 
             emotion_ = emotion.unsqueeze(1).repeat(1, 5, 1)
             emotion_ = torch.cat([emotion_[:, i] for i in range(emotion_.size(1))], dim=0)
-            # emo_loss = emo_loss_disc(emo_label, torch.argmax(emotion_, dim=1)) # loss1 
 
             de_c = disc_emo.forward(g)
-            loss_de_c = emo_loss_disc(de_c, torch.argmax(emotion, dim=1)) # loss2
+            loss_de_c = emo_loss_disc(de_c, torch.argmax(emotion, dim=1)) 
             
             if hparams.syncnet_wt > 0.:
-                sync_loss = get_sync_loss(mel, g) # loss3
+                sync_loss = get_sync_loss(mel, g)
             else:
                 sync_loss = 0.
 
-            l1loss = recon_loss(g, gt) # loss 4
+            l1loss = recon_loss(g, gt)
+            ploss =  perceptual_loss.calculatePerceptionLoss(g,gt)
 
-            # loss = hparams.syncnet_wt * sync_loss + (1 - hparams.syncnet_wt - hparams.emo_wt) * l1loss + hparams.emo_wt * (loss_de_c + emo_loss)
-            loss = hparams.syncnet_wt * sync_loss + (1 - hparams.syncnet_wt - hparams.emo_wt) * l1loss + (hparams.emo_wt * loss_de_c)
+            loss = hparams.syncnet_wt * sync_loss + hparams.pl_wt * ploss + hparams.emo_wt * loss_de_c  
+            loss += (1 - hparams.syncnet_wt - hparams.emo_wt - hparams.pl_wt) * l1loss
 
             loss.backward()
             optimizer.step()
@@ -357,23 +321,18 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
             else:
                 running_sync_loss += 0.
             running_l1_loss += l1loss.item()
+            running_ploss += ploss.item()
             running_loss_de_c += loss_de_c.item()
-            # running_emo_loss += emo_loss.item()
             
             #### training emotion_disc model
             disc_emo.opt.zero_grad()
             g = g.detach()
-            # class_fake = disc_emo(g) # for generated frames
             class_real = disc_emo(gt) # for ground-truth
         
-            # fake class
-            # loss_fake_c = emo_loss_disc(class_fake, (6*torch.ones_like(torch.argmax(emotion, dim=1))).long().to(device))
             loss_real_c = emo_loss_disc(class_real, torch.argmax(emotion, dim=1))
-            # loss_disc = 0.5*(loss_fake_c + loss_real_c) 
             loss_real_c.backward()
             disc_emo.opt.step()
 
-            # running_loss_fake_c += loss_fake_c.item()
             running_loss_real_c += loss_real_c.item()
 
             if global_step == 1 or global_step % checkpoint_interval == 0:
@@ -393,16 +352,16 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
                     if average_sync_loss < .75:
                         hparams.set_hparam('syncnet_wt', 0.03) # without image GAN a lesser weight is sufficient
 
-            prog_bar.set_description('L1: {:.4f}, Sync Loss: {:.4f}, de_c_loss: {:.4f} | loss_real_c: {:.4f}'.format(running_l1_loss / (step + 1),
+            prog_bar.set_description('L1: {:.4f}, Ploss: {:.4f}, Sync Loss: {:.4f}, de_c_loss: {:.4f} | loss_real_c: {:.4f}'.format(running_l1_loss / (step + 1),
+                                                                    running_ploss / (step + 1),
                                                                     running_sync_loss / (step + 1),
                                                                     running_loss_de_c / (step + 1),
                                                                     running_loss_real_c / (step + 1)))
 
         writer.add_scalar("Sync_Loss/train_gen", running_sync_loss/len(train_data_loader), global_epoch)
         writer.add_scalar("L1_Loss/train_gen", running_l1_loss/len(train_data_loader), global_epoch)
-        # writer.add_scalar("Emo_Loss/train_gen", running_emo_loss/len(train_data_loader), global_step)
+        writer.add_scalar("Ploss/train_gen", running_ploss/len(train_data_loader), global_epoch)
         writer.add_scalar("Loss_de_c/train_gen", running_loss_de_c/len(train_data_loader), global_step)
-        # writer.add_scalar("Loss_fake_c/train_disc", running_loss_fake_c/len(train_data_loader), global_step)
         writer.add_scalar("Loss_real_c/train_disc", running_loss_real_c/len(train_data_loader), global_step)
         global_epoch += 1
         
@@ -410,8 +369,8 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
 def eval_model(test_data_loader, global_step, device, model, checkpoint_dir):
     eval_steps = 50
     print('\nEvaluating for {} steps'.format(eval_steps))
-    sync_losses, recon_losses, losses_de_c, emo_losses = [], [], [], []
-    losses_fake_c, losses_real_c = [], []
+    sync_losses, recon_losses, losses_de_c, p_losses = [], [], [], []
+    losses_real_c = []
     step = 0
     while 1:
         for x, indiv_mels, mel, gt, emotion in test_data_loader:
@@ -426,47 +385,41 @@ def eval_model(test_data_loader, global_step, device, model, checkpoint_dir):
             mel = mel.to(device)
             emotion = emotion.to(device)
 
-            # g, emo_label = model(indiv_mels, x, emotion)
             g = model(indiv_mels, x, emotion)
 
             sync_loss = get_sync_loss(mel, g)
             l1loss = recon_loss(g, gt)
+            ploss =  perceptual_loss.calculatePerceptionLoss(g,gt)
 
             de_c = disc_emo.forward(g)
             emotion_ = emotion.unsqueeze(1).repeat(1, 5, 1)
             emotion_ = torch.cat([emotion_[:, i] for i in range(emotion_.size(1))], dim=0)
-            # emo_loss = emo_loss_disc(emo_label, torch.argmax(emotion_, dim=1))
             loss_de_c = emo_loss_disc(de_c, torch.argmax(emotion, dim=1))
 
-            # class_fake = disc_emo(g) # for generated frames
             class_real = disc_emo(gt) # for ground-truth
 
-            # loss_fake_c = emo_loss_disc(class_fake, (6*torch.ones_like(torch.argmax(emotion, dim=1))).long().to(device))
             loss_real_c = emo_loss_disc(class_real, torch.argmax(emotion, dim=1))
 
             sync_losses.append(sync_loss.item())
             recon_losses.append(l1loss.item())
-            # emo_losses.append(emo_loss.item())
+            p_losses.append(ploss.item())
             losses_de_c.append(loss_de_c.item())
-            # losses_fake_c.append(loss_fake_c.item())
             losses_real_c.append(loss_real_c.item())
 
             if step > eval_steps: 
                 averaged_sync_loss = sum(sync_losses) / len(sync_losses)
                 averaged_recon_loss = sum(recon_losses) / len(recon_losses)
-                # averaged_emo_loss = sum(emo_losses) / len(emo_losses)
+                averaged_ploss =  sum(p_losses) / len(p_losses)
                 averaged_loss_de_c = sum(losses_de_c) / len(losses_de_c)
-                # averaged_loss_fake_c = sum(losses_fake_c) / len(losses_fake_c)
                 averaged_loss_real_c = sum(losses_real_c) / len(losses_real_c)
 
-                print('L1: {:.4f}, Sync Loss: {:.4f}, de_c_loss: {:.4f} | loss_real_c: {:.4f}'.format(
-                    averaged_recon_loss, averaged_sync_loss, averaged_loss_de_c, averaged_loss_real_c))
+                print('L1: {:.4f}, Ploss: {:.4f}, Sync Loss: {:.4f}, de_c_loss: {:.4f} | loss_real_c: {:.4f}'.format(
+                    averaged_recon_loss, averaged_ploss, averaged_sync_loss, averaged_loss_de_c, averaged_loss_real_c))
 
                 writer.add_scalar("Sync_Loss/val_gen", averaged_sync_loss, global_step)
                 writer.add_scalar("L1_Loss/val_gen", averaged_recon_loss, global_step)
-                # writer.add_scalar("Emo_Loss/val_gen", averaged_emo_loss, global_step)
+                writer.add_scalar("Ploss/val_gen", averaged_ploss, global_step)
                 writer.add_scalar("Loss_de_c/val_gen", averaged_loss_de_c, global_step)
-                # writer.add_scalar("Loss_fake_c/val_disc", averaged_loss_fake_c, global_step)
                 writer.add_scalar("Loss_real_c/val_disc", averaged_loss_real_c, global_step)
 
                 return averaged_sync_loss
@@ -552,7 +505,7 @@ if __name__ == "__main__":
     if not os.path.exists(checkpoint_dir):
         os.mkdir(checkpoint_dir)
 
-    writer = SummaryWriter('runs_emo/exp3')
+    writer = SummaryWriter('runs_emo/exp4')
 
     # Train!
     train(device, model, train_data_loader, test_data_loader, optimizer,

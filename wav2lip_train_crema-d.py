@@ -308,7 +308,6 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
 
             unfreezeNet(disc_emo)
 
-            running_l1_loss += l1loss.item()
             if hparams.syncnet_wt > 0.:
                 running_sync_loss += sync_loss.item()
             else:
